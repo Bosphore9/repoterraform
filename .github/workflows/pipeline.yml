@@ -1,0 +1,288 @@
+name: Terraform Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+  pull_request:
+    branches:
+      - main
+
+env:
+  TF_VERSION: '1.7.0'
+  WORKING_DIR: './infrastructure'
+
+permissions:
+  contents: read
+  pull-requests: write  # pour commenter le plan sur la PR
+
+jobs:
+  # ──────────────────────────────────────────
+  # JOB 1 : FORMAT CHECK
+  # ──────────────────────────────────────────
+  fmt:
+    name: 'Terraform Format'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform fmt
+        id: fmt
+        run: terraform fmt -check -recursive
+        working-directory: ${{ env.WORKING_DIR }}
+        continue-on-error: false  # bloque si le code n'est pas formaté
+
+  # ──────────────────────────────────────────
+  # JOB 2 : VALIDATE
+  # ──────────────────────────────────────────
+  validate:
+    name: 'Terraform Validate'
+    runs-on: ubuntu-latest
+    needs: fmt
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init (sans backend pour validation)
+        run: terraform init -backend=false
+        working-directory: ${{ env.WORKING_DIR }}
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+        working-directory: ${{ env.WORKING_DIR }}
+
+  # ──────────────────────────────────────────
+  # JOB 3 : PLAN (par workspace)
+  # ──────────────────────────────────────────
+  plan:
+    name: 'Terraform Plan — ${{ matrix.workspace }}'
+    runs-on: ubuntu-latest
+    needs: validate
+
+    strategy:
+      matrix:
+        workspace: [dev, staging, prod]
+      fail-fast: false  # continue les autres workspaces si l'un échoue
+
+    environment: ${{ matrix.workspace }}
+
+    env:
+      GOOGLE_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}  # ou AWS_ACCESS_KEY_ID, etc.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true  # permet de capturer l'output du plan
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=terraform/${{ matrix.workspace }}"
+        working-directory: ${{ env.WORKING_DIR }}
+
+      - name: Sélectionner ou créer le workspace
+        run: |
+          terraform workspace select ${{ matrix.workspace }} || \
+          terraform workspace new ${{ matrix.workspace }}
+        working-directory: ${{ env.WORKING_DIR }}
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file="environments/${{ matrix.workspace }}.tfvars" \
+            -out=tfplan-${{ matrix.workspace }} \
+            -no-color \
+            -input=false
+        working-directory: ${{ env.WORKING_DIR }}
+
+      - name: Sauvegarder le plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.workspace }}
+          path: ${{ env.WORKING_DIR }}/tfplan-${{ matrix.workspace }}
+          retention-days: 5
+
+      - name: Commenter le plan sur la PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const output = `## Terraform Plan — \`${{ matrix.workspace }}\`
+            
+            **Init** : \`${{ steps.init.outcome }}\`
+            **Plan** : \`${{ steps.plan.outcome }}\`
+
+            <details><summary>Voir le plan complet</summary>
+
+            \`\`\`hcl
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+
+            </details>
+
+            *Déclenché par @${{ github.actor }} sur \`${{ github.ref }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+  # ──────────────────────────────────────────
+  # JOB 4 : APPLY — DEV (auto sur push main)
+  # ──────────────────────────────────────────
+  apply-dev:
+    name: 'Terraform Apply — dev'
+    runs-on: ubuntu-latest
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    environment:
+      name: dev
+
+    env:
+      GOOGLE_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Télécharger le plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-dev
+          path: ${{ env.WORKING_DIR }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=terraform/dev"
+        working-directory: ${{ env.WORKING_DIR }}
+
+      - name: Sélectionner le workspace dev
+        run: terraform workspace select dev
+        working-directory: ${{ env.WORKING_DIR }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -input=false tfplan-dev
+        working-directory: ${{ env.WORKING_DIR }}
+
+  # ──────────────────────────────────────────
+  # JOB 5 : APPLY — STAGING (approbation requise)
+  # ──────────────────────────────────────────
+  apply-staging:
+    name: 'Terraform Apply — staging'
+    runs-on: ubuntu-latest
+    needs: apply-dev
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    environment:
+      name: staging  # protection rule avec reviewer dans GitHub
+
+    env:
+      GOOGLE_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Télécharger le plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-staging
+          path: ${{ env.WORKING_DIR }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=terraform/staging"
+        working-directory: ${{ env.WORKING_DIR }}
+
+      - name: Sélectionner le workspace staging
+        run: terraform workspace select staging
+        working-directory: ${{ env.WORKING_DIR }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -input=false tfplan-staging
+        working-directory: ${{ env.WORKING_DIR }}
+
+  # ──────────────────────────────────────────
+  # JOB 6 : APPLY — PROD (double approbation)
+  # ──────────────────────────────────────────
+  apply-prod:
+    name: 'Terraform Apply — prod'
+    runs-on: ubuntu-latest
+    needs: apply-staging
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    environment:
+      name: prod  # protection rule avec 2 reviewers dans GitHub
+
+    env:
+      GOOGLE_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Télécharger le plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-prod
+          path: ${{ env.WORKING_DIR }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=terraform/prod"
+        working-directory: ${{ env.WORKING_DIR }}
+
+      - name: Sélectionner le workspace prod
+        run: terraform workspace select prod
+        working-directory: ${{ env.WORKING_DIR }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -input=false tfplan-prod
+        working-directory: ${{ env.WORKING_DIR }}
